@@ -10,7 +10,9 @@ internal sealed class PatchScriptCompilationOperation : IUpdateOperation
     private const string DllName = "ScriptCompilationBuildProgram.Data.dll";
     private const string Namespace = "ScriptCompilationBuildProgram.Data";
 
-    private static readonly HashSet<string> SkipFields = ["DotnetRuntimePath", "DotnetRoslynPath"];
+    private static readonly HashSet<string> SkipFields =
+        ["DotnetRuntimePath", "DotnetRoslynPath", "DotnetRoslynPathProp", "DotnetRuntimePathProp"];
+    private static readonly HashSet<string> InjectedTypes = ["StaticState"];
 
     public async Task ExecuteAsync(UpdateContext context)
     {
@@ -63,7 +65,7 @@ internal sealed class PatchScriptCompilationOperation : IUpdateOperation
 
         foreach (var type in module.TopLevelTypes)
         {
-            if (type.Namespace != Namespace || type.Name == "<Module>")
+            if (type.Namespace != Namespace || type.Name == "<Module>" || InjectedTypes.Contains(type.Name!))
                 continue;
 
             var isPartial = type.Name == "ScriptCompilationData";
