@@ -14,7 +14,7 @@ internal sealed class PatchScriptCompilationOperation : IUpdateOperation
 
     public async Task ExecuteAsync(UpdateContext context)
     {
-        var dllPath = Path.Combine(context.EditorDataPath, "Tools", "BuildPipeline", DllName);
+        var dllPath = Path.Combine(context.EditorDataPath, "Managed", DllName);
         var backupPath = dllPath + ".bak";
 
         if (!File.Exists(dllPath))
@@ -147,7 +147,7 @@ internal sealed class PatchScriptCompilationOperation : IUpdateOperation
                 """
                 <Project Sdk="Microsoft.NET.Sdk">
                   <PropertyGroup>
-                    <TargetFramework>netstandard2.1</TargetFramework>
+                    <TargetFramework>netstandard2.0</TargetFramework>
                     <LangVersion>latest</LangVersion>
                     <Nullable>enable</Nullable>
                     <EnableDefaultItems>true</EnableDefaultItems>
@@ -184,7 +184,7 @@ internal sealed class PatchScriptCompilationOperation : IUpdateOperation
             }
 
             // Read the compiled DLL
-            var outputPath = Path.Combine(tempDir, "bin", "Release", "netstandard2.1", DllName);
+            var outputPath = Path.Combine(tempDir, "bin", "Release", "netstandard2.0", DllName);
             return await File.ReadAllBytesAsync(outputPath);
         }
         finally
