@@ -1,17 +1,21 @@
 using System.Diagnostics;
-using System.Text.RegularExpressions;
+using System.Text;
+using AsmResolver.DotNet;
+using AsmResolver.DotNet.Signatures;
 
 namespace UnityRoslynUpdater;
 
-internal sealed partial class PatchScriptCompilationOperation : IUpdateOperation
+internal sealed class PatchScriptCompilationOperation : IUpdateOperation
 {
-    private const string GitHubRawBaseUrl = "https://raw.githubusercontent.com/Unity-Technologies/UnityCsReference";
-    private const string DataCsPath = "Editor/IncrementalBuildPipeline/ScriptCompilationBuildProgram.Data/Data.cs";
     private const string DllName = "ScriptCompilationBuildProgram.Data.dll";
+    private const string Namespace = "ScriptCompilationBuildProgram.Data";
+
+    private static readonly HashSet<string> SkipFields = ["DotnetRuntimePath", "DotnetRoslynPath"];
 
     public async Task ExecuteAsync(UpdateContext context)
     {
         var dllPath = Path.Combine(context.EditorDataPath, "Tools", "BuildPipeline", DllName);
+        var backupPath = dllPath + ".bak";
 
         if (!File.Exists(dllPath))
         {
@@ -19,44 +23,17 @@ internal sealed partial class PatchScriptCompilationOperation : IUpdateOperation
             return;
         }
 
-        var version = ParseUnityVersion(context.EditorPath);
+        // Save original on first run; always decompile from the unpatched backup
+        if (!File.Exists(backupPath))
+            File.Copy(dllPath, backupPath);
 
-        if (version is null)
+        var decompiled = DecompileToSource(backupPath);
+
+        if (decompiled is null)
         {
-            Console.Error.WriteLine("Could not determine Unity version from editor path.");
+            Console.Error.WriteLine($"Failed to decompile {DllName}.");
             return;
         }
-
-        // Fetch original source from UnityCsReference for this Unity version
-        var sourceUrl = $"{GitHubRawBaseUrl}/{version}/{DataCsPath}";
-
-        using var httpClient = new HttpClient();
-        HttpResponseMessage response;
-
-        try
-        {
-            response = await httpClient.GetAsync(sourceUrl);
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"Failed to fetch source from GitHub: {ex.Message}");
-            return;
-        }
-
-        if (!response.IsSuccessStatusCode)
-        {
-            Console.Error.WriteLine($"Failed to fetch {sourceUrl}: {response.StatusCode}");
-            return;
-        }
-
-        var originalSource = await response.Content.ReadAsStringAsync();
-
-        // Modify source: make ScriptCompilationData partial, remove the two fields we're replacing
-        var modifiedSource = originalSource
-            .Replace("public class ScriptCompilationData", "public partial class ScriptCompilationData");
-
-        modifiedSource = DotnetRuntimePathFieldRegex().Replace(modifiedSource, "");
-        modifiedSource = DotnetRoslynPathFieldRegex().Replace(modifiedSource, "");
 
         // Load injection source from embedded resource
         using var resourceStream = typeof(Program).Assembly.GetManifestResourceStream("InjectedCompilerRedirect.cs")!;
@@ -64,44 +41,94 @@ internal sealed partial class PatchScriptCompilationOperation : IUpdateOperation
         var injectionSource = await reader.ReadToEndAsync();
 
         // Compile using dotnet build in a temp directory
-        var compiledBytes = await CompileWithDotnetBuild(modifiedSource, injectionSource);
+        var compiledBytes = await CompileWithDotnetBuild(decompiled, injectionSource);
 
         if (compiledBytes is null)
             return;
 
-        // Replace DLL with backup
-        var backup = File.ReadAllBytes(dllPath);
-
-        try
-        {
-            File.WriteAllBytes(dllPath, compiledBytes);
-        }
-        catch
-        {
-            File.WriteAllBytes(dllPath, backup);
-            throw;
-        }
-
-        Console.WriteLine($"Patched {DllName} for Unity {version}.");
+        File.WriteAllBytes(dllPath, compiledBytes);
+        Console.WriteLine($"Patched {DllName}.");
     }
 
-    private static string? ParseUnityVersion(string editorPath)
+    private static string? DecompileToSource(string dllPath)
     {
-        // Editor path is like: C:\...\6000.0.23f1\Editor or C:\...\2022.3.46f1\Editor
-        // Walk up directory components looking for a Unity version pattern
-        var path = Path.GetFullPath(editorPath);
+        var assembly = AssemblyDefinition.FromFile(dllPath);
 
-        while (path is not null)
+        if (assembly.ManifestModule is not { } module)
+            return null;
+
+        var sb = new StringBuilder();
+        sb.AppendLine($"namespace {Namespace};");
+        sb.AppendLine();
+
+        foreach (var type in module.TopLevelTypes)
         {
-            var dirName = Path.GetFileName(path);
+            if (type.Namespace != Namespace || type.Name == "<Module>")
+                continue;
 
-            if (dirName is not null && UnityVersionRegex().IsMatch(dirName))
-                return dirName;
+            var isPartial = type.Name == "ScriptCompilationData";
+            var keyword = type.IsSealed && type.IsAbstract ? "static" : "";
+            var partial = isPartial ? "partial" : "";
 
-            path = Path.GetDirectoryName(path);
+            sb.AppendLine($"public {keyword} {partial} class {type.Name}".Replace("  ", " ").Trim());
+            sb.AppendLine("{");
+
+            foreach (var field in type.Fields)
+            {
+                if (!field.IsPublic)
+                    continue;
+
+                if (isPartial && SkipFields.Contains(field.Name!))
+                    continue;
+
+                var typeName = ToCSharpTypeName(field.Signature!.FieldType);
+                var isConst = field.IsStatic && field.IsLiteral;
+
+                if (isConst && field.Constant?.Value is { } blob)
+                {
+                    var valueStr = typeName == "string"
+                        ? $"\"{Encoding.Unicode.GetString(blob.Data).TrimEnd('\0')}\""
+                        : blob.InterpretData(field.Signature!.FieldType.ElementType)?.ToString() ?? "null";
+                    sb.AppendLine($"    public const {typeName} {field.Name} = {valueStr};");
+                }
+                else
+                {
+                    var initializer = GetFieldInitializer(field.Signature!.FieldType);
+                    sb.AppendLine($"    public {typeName} {field.Name}{initializer};");
+                }
+            }
+
+            sb.AppendLine("}");
+            sb.AppendLine();
         }
 
-        return null;
+        return sb.ToString();
+    }
+
+    private static string ToCSharpTypeName(TypeSignature type)
+    {
+        if (type is SzArrayTypeSignature arrayType)
+            return $"{ToCSharpTypeName(arrayType.BaseType)}[]";
+
+        return type.FullName switch
+        {
+            "System.String" => "string",
+            "System.Boolean" => "bool",
+            "System.Int32" => "int",
+            "System.Int64" => "long",
+            "System.Single" => "float",
+            "System.Double" => "double",
+            "System.Object" => "object",
+            _ => type.Name ?? type.FullName,
+        };
+    }
+
+    private static string GetFieldInitializer(TypeSignature type)
+    {
+        if (type is SzArrayTypeSignature arrayType)
+            return $" = new {ToCSharpTypeName(arrayType.BaseType)}[0]";
+
+        return "";
     }
 
     private static async Task<byte[]?> CompileWithDotnetBuild(string modifiedDataCs, string injectionCs)
@@ -165,13 +192,4 @@ internal sealed partial class PatchScriptCompilationOperation : IUpdateOperation
             try { Directory.Delete(tempDir, recursive: true); } catch { }
         }
     }
-
-    [GeneratedRegex(@"^\d+\.\d+\.\d+[a-z]\d+$")]
-    private static partial Regex UnityVersionRegex();
-
-    [GeneratedRegex(@"^[ \t]*public\s+string\s+DotnetRuntimePath\s*;[ \t]*\r?\n", RegexOptions.Multiline)]
-    private static partial Regex DotnetRuntimePathFieldRegex();
-
-    [GeneratedRegex(@"^[ \t]*public\s+string\s+DotnetRoslynPath\s*;[ \t]*\r?\n", RegexOptions.Multiline)]
-    private static partial Regex DotnetRoslynPathFieldRegex();
 }
