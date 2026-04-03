@@ -1,6 +1,5 @@
+using System.Diagnostics;
 using System.Text.RegularExpressions;
-using Microsoft.CodeAnalysis;
-using Microsoft.CodeAnalysis.CSharp;
 
 namespace UnityRoslynUpdater;
 
@@ -64,17 +63,8 @@ internal sealed partial class PatchScriptCompilationOperation : IUpdateOperation
         using var reader = new StreamReader(resourceStream);
         var injectionSource = await reader.ReadToEndAsync();
 
-        // Find netstandard.dll reference assembly
-        var netstandardPath = Path.Combine(context.EditorDataPath, "NetStandard", "Ref", "2.1.0", "netstandard.dll");
-
-        if (!File.Exists(netstandardPath))
-        {
-            Console.Error.WriteLine($"netstandard.dll not found at {netstandardPath}.");
-            return;
-        }
-
-        // Compile
-        var compiledBytes = Compile(modifiedSource, injectionSource, netstandardPath);
+        // Compile using dotnet build in a temp directory
+        var compiledBytes = await CompileWithDotnetBuild(modifiedSource, injectionSource);
 
         if (compiledBytes is null)
             return;
@@ -114,44 +104,66 @@ internal sealed partial class PatchScriptCompilationOperation : IUpdateOperation
         return null;
     }
 
-    private static byte[]? Compile(string modifiedDataCs, string injectionCs, string netstandardPath)
+    private static async Task<byte[]?> CompileWithDotnetBuild(string modifiedDataCs, string injectionCs)
     {
-        var trees = new[]
+        var tempDir = Path.Combine(Path.GetTempPath(), $"UnityRoslynUpdater_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(tempDir);
+
+        try
         {
-            CSharpSyntaxTree.ParseText(modifiedDataCs),
-            CSharpSyntaxTree.ParseText(injectionCs),
-        };
+            // Write source files
+            await File.WriteAllTextAsync(Path.Combine(tempDir, "Data.cs"), modifiedDataCs);
+            await File.WriteAllTextAsync(Path.Combine(tempDir, "InjectedCompilerRedirect.cs"), injectionCs);
 
-        var references = new MetadataReference[]
-        {
-            MetadataReference.CreateFromFile(netstandardPath),
-        };
+            // Write .csproj
+            await File.WriteAllTextAsync(Path.Combine(tempDir, "ScriptCompilationBuildProgram.Data.csproj"),
+                """
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup>
+                    <TargetFramework>netstandard2.1</TargetFramework>
+                    <LangVersion>latest</LangVersion>
+                    <Nullable>enable</Nullable>
+                    <EnableDefaultItems>true</EnableDefaultItems>
+                  </PropertyGroup>
+                </Project>
+                """);
 
-        var compilation = CSharpCompilation.Create(
-            "ScriptCompilationBuildProgram.Data",
-            trees,
-            references,
-            new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary)
-                .WithNullableContextOptions(NullableContextOptions.Enable)
-        );
-
-        using var ms = new MemoryStream();
-        var result = compilation.Emit(ms);
-
-        if (!result.Success)
-        {
-            Console.Error.WriteLine("Compilation failed:");
-
-            foreach (var diagnostic in result.Diagnostics)
+            // Run dotnet build
+            var process = new Process
             {
-                if (diagnostic.Severity == DiagnosticSeverity.Error)
-                    Console.Error.WriteLine($"  {diagnostic}");
+                StartInfo = new ProcessStartInfo
+                {
+                    FileName = "dotnet",
+                    Arguments = "build -c Release --nologo",
+                    WorkingDirectory = tempDir,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                }
+            };
+
+            process.Start();
+            var stdout = await process.StandardOutput.ReadToEndAsync();
+            var stderr = await process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync();
+
+            if (process.ExitCode != 0)
+            {
+                Console.Error.WriteLine("dotnet build failed:");
+                Console.Error.WriteLine(stdout);
+                Console.Error.WriteLine(stderr);
+                return null;
             }
 
-            return null;
+            // Read the compiled DLL
+            var outputPath = Path.Combine(tempDir, "bin", "Release", "netstandard2.1", DllName);
+            return await File.ReadAllBytesAsync(outputPath);
         }
-
-        return ms.ToArray();
+        finally
+        {
+            try { Directory.Delete(tempDir, recursive: true); } catch { }
+        }
     }
 
     [GeneratedRegex(@"^\d+\.\d+\.\d+[a-z]\d+$")]
