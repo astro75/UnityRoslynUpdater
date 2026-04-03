@@ -21,9 +21,10 @@ var context = new UpdateContext
 
 IUpdateOperation[] operations =
 [
-    new UpdateSdkOperation(),
+    // new UpdateSdkOperation(),
     new PatchSourceGeneratorOperation(),
-    new PatchUnityAssembliesOperation(),
+    // new PatchUnityAssembliesOperation(),
+    new PatchScriptCompilationOperation(),
     new DownloadBclDocumentationOperation(),
 ];
 
